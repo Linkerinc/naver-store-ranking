@@ -1,0 +1,18 @@
+# Render.com 배포 설정 (Blueprint) — 무료 플랜
+# Render 대시보드에서 "New → Blueprint"로 이 저장소를 연결하면 자동 구성됩니다.
+# ※ 무료 플랜: 15분 유휴 시 잠듦(첫 접속 시 약 1분 대기), 재시작 시 데이터 초기화.
+#    나중에 유료 전환 시: plan을 starter로 바꾸고 disk 설정을 추가하면 됩니다 (DEPLOY.md 참고)
+services:
+  - type: web
+    name: naver-store-ranking
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 --threads 8 -b 0.0.0.0:$PORT server_app:app
+    envVars:
+      - key: NAVER_CLIENT_ID
+        sync: false          # 배포 시 직접 입력
+      - key: NAVER_CLIENT_SECRET
+        sync: false          # 배포 시 직접 입력
+      - key: ADMIN_KEY
+        generateValue: true  # 관리자 페이지 키 자동 생성

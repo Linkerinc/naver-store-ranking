@@ -235,7 +235,8 @@ if(rows2.length){
 """
 
 
-def build_dashboard(results, summary, store_name, run_date, out_path):
+def render_dashboard_html(results, summary, store_name, run_date):
+    """대시보드 HTML 문자열 생성 (파일 저장 없이)."""
     # 대시보드용 데이터 축약 (경쟁사 풀은 상위 60개까지만 점으로)
     slim = []
     for r in results:
@@ -254,11 +255,15 @@ def build_dashboard(results, summary, store_name, run_date, out_path):
             "verdict": r["verdict"], "excluded": r.get("excluded", 0),
             "competitors": comps,
         })
-    html = (TEMPLATE
+    return (TEMPLATE
             .replace("__STORE__", store_name)
             .replace("__DATE__", run_date)
             .replace("__DATA__", json.dumps(
                 {"results": slim, "summary": summary}, ensure_ascii=False)))
+
+
+def build_dashboard(results, summary, store_name, run_date, out_path):
+    html = render_dashboard_html(results, summary, store_name, run_date)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     return out_path
