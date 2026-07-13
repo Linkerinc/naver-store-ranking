@@ -176,7 +176,15 @@ def api_register():
         if not re.search(r"(smartstore|brand)\.naver\.com/[\w\-.]+", url):
             return jsonify({"ok": False,
                             "msg": "스마트스토어 주소 형식이 아닙니다. 예: https://smartstore.naver.com/xxxxx"})
-        name = detect_store_name(url)
+        name = None
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            ex = ThreadPoolExecutor(max_workers=1)
+            fut = ex.submit(detect_store_name, url)
+            name = fut.result(timeout=9)
+            ex.shutdown(wait=False)
+        except Exception:
+            name = None
         if not name:
             return jsonify({"ok": False, "need_name": True,
                             "msg": "스토어명 자동 인식에 실패했습니다. 스토어명을 직접 입력해 주세요."})
@@ -418,8 +426,17 @@ async function reg(){
                 store_name: (document.getElementById("sname")||{}).value?.trim() || ""};
   m.className="msg"; m.textContent="확인 중...";
   document.getElementById("btnReg").disabled = true;
-  const r = await (await fetch("/api/register",{method:"POST",
-    headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json();
+  let r;
+  try{
+    const ac = new AbortController();
+    const timer = setTimeout(()=>ac.abort(), 20000);
+    r = await (await fetch("/api/register",{method:"POST", signal: ac.signal,
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})).json();
+    clearTimeout(timer);
+  }catch(e){
+    r = {ok:false, need_name:true,
+         msg:"자동 확인이 지연되고 있습니다. 아래 칸에 스토어명을 직접 입력하고 다시 등록을 눌러 주세요."};
+  }
   document.getElementById("btnReg").disabled = false;
   if(!r.ok){
     m.className="msg err"; m.textContent = r.msg;
