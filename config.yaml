@@ -1,0 +1,14 @@
+search:
+  max_rank: 1000
+  compare_top: 100
+pricing_rules:
+  fair_band_pct: 10
+  warn_vs_min_pct: 30
+  unit_band_ratio: 2.2
+keywords:
+- keyword: 3M 8977K 방진마스크
+  product: 8977K
+- keyword: 3M 귀마개 1100
+  product: '1100'
+- keyword: 3M 보안경
+  product: 보안경
