@@ -95,90 +95,21 @@ def get_store(token):
     return r
 
 
-# ---------------- 수집 워커 (전역 직렬 큐) ----------------
+# ---------------- 수집 (브라우저 구동 단계 방식) ----------------
+# 무료 호스팅에서 백그라운드 스레드가 불안정하므로,
+# 브라우저가 /api/run_start 후 /api/run_step을 키워드 수만큼 호출한다.
 
-RUN_STATUS = {}   # store_id -> {running, done, total, current, error}
-JOBS = queue.Queue()
+PENDING = {}   # store_id -> {"kws": [...], "results": [...]}
+_PLOCK = threading.Lock()
 
 
-def _fetch_factory():
+def _fetch(keyword, store_name):
     if DEMO:
         from demo_data import demo_search
-        return lambda kw, store_name: demo_search(kw, store_name)
+        return demo_search(keyword, store_name)
     from collector import NaverShopClient
     client = NaverShopClient(CLIENT_ID, CLIENT_SECRET)
-    return lambda kw, store_name: client.search(kw, max_rank=MAX_RANK)
-
-
-def collect_store(store_id):
-    status = RUN_STATUS.setdefault(store_id, {})
-    try:
-        print(f"[collect] 시작: store {store_id}", flush=True)
-        with db() as con:
-            st = con.execute("SELECT * FROM stores WHERE id=?", (store_id,)).fetchone()
-            kws = con.execute("SELECT * FROM keywords WHERE store_id=? ORDER BY id",
-                              (store_id,)).fetchall()
-        if not st or not kws:
-            status.update(running=False, error="키워드가 없습니다. 먼저 등록해 주세요.")
-            return
-        fetch = _fetch_factory()
-        store_cfg = {"name": st["name"], "aliases": []}
-        status.update(running=True, done=0, total=len(kws), current="", error=None)
-        results = []
-        for i, k in enumerate(kws):
-            status.update(done=i, current=k["keyword"])
-            print(f"[collect] ({i+1}/{len(kws)}) {k['keyword']}", flush=True)
-            items = fetch(k["keyword"], st["name"])
-            print(f"[collect]   → {len(items)}개 수집됨", flush=True)
-            kw_cfg = {"keyword": k["keyword"], "product": k["product"]}
-            results.append(analyze_keyword(kw_cfg, items, store_cfg, SEARCH_CFG, RULES))
-        status.update(done=len(kws), current="리포트 저장 중")
-        summ = store_summary(results)
-        now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-        with db() as con:
-            con.execute("INSERT INTO runs(store_id, run_at, summary, results) VALUES(?,?,?,?)",
-                        (store_id, now, json.dumps(summ, ensure_ascii=False),
-                         json.dumps(results, ensure_ascii=False)))
-            con.execute("UPDATE stores SET last_run=? WHERE id=?", (now, store_id))
-            # 오래된 실행 기록 정리 (스토어당 최근 60개 유지)
-            con.execute("""DELETE FROM runs WHERE store_id=? AND id NOT IN
-                         (SELECT id FROM runs WHERE store_id=? ORDER BY id DESC LIMIT 60)""",
-                        (store_id, store_id))
-        print(f"[collect] 완료: store {store_id}", flush=True)
-    except Exception as e:  # noqa
-        status["error"] = f"수집 중 오류: {e}"
-        print(f"[collect] 오류: store {store_id}: {e}", flush=True)
-    finally:
-        status["running"] = False
-
-
-def worker():
-    while True:
-        store_id = JOBS.get()
-        try:
-            collect_store(store_id)
-        except Exception as e:  # 최후 방어선 — 작업자는 절대 죽지 않는다
-            RUN_STATUS.setdefault(store_id, {}).update(
-                running=False, error=f"수집 실패: {e}")
-            print(f"[worker] 예외: {e}", flush=True)
-        finally:
-            JOBS.task_done()
-
-
-_worker_thread = threading.Thread(target=worker, daemon=True)
-_worker_thread.start()
-
-
-def _ensure_worker():
-    """작업자 스레드가 죽어 있으면 되살린다."""
-    global _worker_thread
-    if not _worker_thread.is_alive():
-        print("[worker] 재기동", flush=True)
-        _worker_thread = threading.Thread(target=worker, daemon=True)
-        _worker_thread.start()
-
-
-
+    return client.search(keyword, max_rank=MAX_RANK)
 
 
 # ---------------- 등록 / 대리점 API ----------------
@@ -224,7 +155,6 @@ def _store_or_404(token):
 @app.get("/s/<token>/api/state")
 def api_store_state(token):
     st = _store_or_404(token)
-    status = RUN_STATUS.get(st["id"], {})
     with db() as con:
         kw_count = con.execute("SELECT COUNT(*) c FROM keywords WHERE store_id=?",
                                (st["id"],)).fetchone()["c"]
@@ -234,9 +164,6 @@ def api_store_state(token):
     return jsonify({
         "store_name": st["name"], "last_run": st["last_run"],
         "keyword_count": kw_count,
-        "run": {"running": status.get("running", False),
-                "done": status.get("done", 0), "total": status.get("total", 0),
-                "current": status.get("current", ""), "error": status.get("error")},
         "runs": [{"id": r["id"], "run_at": r["run_at"],
                   "summary": json.loads(r["summary"])} for r in runs],
     })
@@ -266,12 +193,9 @@ def api_kw_save(token):
     return jsonify({"ok": True, "count": len(clean), "max": MAX_KEYWORDS})
 
 
-@app.post("/s/<token>/api/run")
-def api_store_run(token):
+@app.post("/s/<token>/api/run_start")
+def api_run_start(token):
     st = _store_or_404(token)
-    status = RUN_STATUS.get(st["id"], {})
-    if status.get("running"):
-        return jsonify({"ok": False, "msg": "이미 수집이 진행 중입니다."})
     # 쿨다운: 마지막 실행 후 10분
     if st["last_run"]:
         try:
@@ -282,12 +206,60 @@ def api_store_run(token):
                                 "msg": f"잠시 후 다시 시도해 주세요 (약 {int(wait // 60) + 1}분 후 가능)."})
         except ValueError:
             pass
-    _ensure_worker()
-    RUN_STATUS[st["id"]] = {"running": True, "done": 0, "total": 0,
-                            "current": "대기열 등록됨", "error": None}
-    JOBS.put(st["id"])
-    print(f"[run] 대기열 등록: store {st['id']}", flush=True)
-    return jsonify({"ok": True})
+    with db() as con:
+        kws = con.execute("SELECT keyword, product FROM keywords WHERE store_id=? ORDER BY id",
+                          (st["id"],)).fetchall()
+    if not kws:
+        return jsonify({"ok": False, "msg": "키워드를 먼저 등록하고 저장해 주세요."})
+    with _PLOCK:
+        PENDING[st["id"]] = {"kws": [dict(k) for k in kws], "results": []}
+    print(f"[run] 시작: store {st['id']} 키워드 {len(kws)}개", flush=True)
+    return jsonify({"ok": True, "total": len(kws),
+                    "keywords": [k["keyword"] for k in kws]})
+
+
+@app.post("/s/<token>/api/run_step")
+def api_run_step(token):
+    st = _store_or_404(token)
+    p = PENDING.get(st["id"])
+    if not p:
+        return jsonify({"ok": False, "msg": "진행 중인 수집이 없습니다. 다시 시작해 주세요."})
+    i = len(p["results"])
+    if i >= len(p["kws"]):
+        return jsonify({"ok": True, "done": True})
+    k = p["kws"][i]
+    try:
+        print(f"[collect] ({i + 1}/{len(p['kws'])}) {k['keyword']}", flush=True)
+        items = _fetch(k["keyword"], st["name"])
+        res = analyze_keyword({"keyword": k["keyword"], "product": k.get("product", "")},
+                              items, {"name": st["name"], "aliases": []},
+                              SEARCH_CFG, RULES)
+        p["results"].append(res)
+        print(f"[collect]   → {len(items)}개, 우리 순위 {res['our_rank']}", flush=True)
+    except Exception as e:
+        with _PLOCK:
+            PENDING.pop(st["id"], None)
+        print(f"[collect] 오류: {e}", flush=True)
+        return jsonify({"ok": False, "msg": f"수집 중 오류: {e}"})
+
+    if len(p["results"]) < len(p["kws"]):
+        return jsonify({"ok": True, "done": False, "next": len(p["results"])})
+
+    # 마지막 키워드 완료 → 리포트 저장
+    summ = store_summary(p["results"])
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    with db() as con:
+        con.execute("INSERT INTO runs(store_id, run_at, summary, results) VALUES(?,?,?,?)",
+                    (st["id"], now, json.dumps(summ, ensure_ascii=False),
+                     json.dumps(p["results"], ensure_ascii=False)))
+        con.execute("UPDATE stores SET last_run=? WHERE id=?", (now, st["id"]))
+        con.execute("""DELETE FROM runs WHERE store_id=? AND id NOT IN
+                     (SELECT id FROM runs WHERE store_id=? ORDER BY id DESC LIMIT 60)""",
+                    (st["id"], st["id"]))
+    with _PLOCK:
+        PENDING.pop(st["id"], None)
+    print(f"[run] 완료: store {st['id']}", flush=True)
+    return jsonify({"ok": True, "done": True, "saved": True})
 
 
 def _load_run(token, run_id):
@@ -571,31 +543,33 @@ async function saveKeywords(){
   setTimeout(()=>m.textContent="",2500);
 }
 async function runNow(){
-  const r = await j(api("run"), {});
   const m = document.getElementById("runMsg");
-  if(!r.ok){ m.className="msg err"; m.textContent=r.msg; setTimeout(()=>m.textContent="",6000); return; }
-  m.textContent=""; poll();
-}
-let pt=null;
-function poll(){
-  clearTimeout(pt);
-  pt=setTimeout(async()=>{
-    const st = await j(api("state"));
-    render(st);
-    if(st.run.running) poll();
-  }, 1200);
-}
-function render(st){
   const bar=document.getElementById("barBox"), fill=document.getElementById("barFill");
   const stat=document.getElementById("runStatus"), btn=document.getElementById("btnRun");
-  btn.disabled = st.run.running;
-  bar.classList.toggle("hidden", !st.run.running);
-  stat.classList.toggle("hidden", !st.run.running && !st.run.error);
-  if(st.run.running){
-    const pct = st.run.total? Math.round(st.run.done/st.run.total*90)+5 : 5;
-    fill.style.width=pct+"%";
-    stat.className="msg"; stat.textContent=`수집 중 (${st.run.done}/${st.run.total||"?"}) — ${st.run.current}`;
-  } else if(st.run.error){ stat.className="msg err"; stat.textContent=st.run.error; }
+  m.textContent="";
+  const s = await j(api("run_start"), {});
+  if(!s.ok){ m.className="msg err"; m.textContent=s.msg; setTimeout(()=>m.textContent="",8000); return; }
+  btn.disabled = true;
+  bar.classList.remove("hidden"); stat.classList.remove("hidden");
+  for(let i=0; i<s.total; i++){
+    stat.className="msg";
+    stat.textContent=`수집 중 (${i+1}/${s.total}) — ${s.keywords[i]}`;
+    fill.style.width = Math.round(i/s.total*90)+5+"%";
+    const r = await j(api("run_step"), {});
+    if(!r.ok){
+      stat.className="msg err"; stat.textContent=r.msg;
+      btn.disabled=false; bar.classList.add("hidden");
+      return;
+    }
+    if(r.done) break;
+  }
+  fill.style.width="100%";
+  stat.className="msg ok"; stat.textContent="✓ 수집 완료! 아래 리포트에서 확인하세요.";
+  btn.disabled=false;
+  setTimeout(()=>{ bar.classList.add("hidden"); stat.classList.add("hidden"); }, 4000);
+  const st = await j(api("state")); render(st);
+}
+function render(st){
   const el=document.getElementById("repList");
   if(!st.runs.length){ el.innerHTML='<div class="pill">아직 리포트가 없습니다. 키워드 저장 후 "지금 수집하기"를 눌러보세요.</div>'; return; }
   el.innerHTML = st.runs.map(r=>{
@@ -606,7 +580,7 @@ function render(st){
       <span class="pill">${info}</span></div>`;
   }).join("");
 }
-(async()=>{ loadKeywords(); const st=await j(api("state")); render(st); if(st.run.running) poll(); })();
+(async()=>{ loadKeywords(); const st=await j(api("state")); render(st); })();
 </script></body></html>"""
 
 
