@@ -21,7 +21,7 @@ def detect_store_name(url: str):
         url = "https://" + url
     try:
         r = requests.get(url, headers=UA, timeout=(4, 6))
-        html = r.text
+        html = r.content.decode("utf-8", "ignore")
         # 1) 스마트스토어 내부 데이터의 채널명 (가장 정확)
         m = re.search(r'"channelName"\s*:\s*"([^"]+)"', html)
         if m:

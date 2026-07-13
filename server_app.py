@@ -310,6 +310,18 @@ def store_excel(token, run_id):
 
 # ---------------- 관리자 ----------------
 
+@app.get("/admin/<key>/delete/<int:store_id>")
+def admin_delete(key, store_id):
+    if not ADMIN_KEY or key != ADMIN_KEY:
+        abort(404)
+    with db() as con:
+        con.execute("DELETE FROM keywords WHERE store_id=?", (store_id,))
+        con.execute("DELETE FROM runs WHERE store_id=?", (store_id,))
+        con.execute("DELETE FROM stores WHERE id=?", (store_id,))
+    return Response('<meta charset="utf-8">삭제 완료. <a href="/admin/%s">목록으로</a>' % key,
+                    mimetype="text/html")
+
+
 @app.get("/admin/<key>")
 def admin(key):
     if not ADMIN_KEY or key != ADMIN_KEY:
@@ -323,7 +335,9 @@ def admin(key):
         f"<tr><td>{s['id']}</td><td><b>{s['name']}</b></td>"
         f"<td><a href='/s/{s['token']}' target='_blank'>{s['token']}</a></td>"
         f"<td>{s['kw']}</td><td>{s['rc']}</td><td>{s['last_run'] or '-'}</td>"
-        f"<td>{s['created']}</td></tr>" for s in stores)
+        f"<td>{s['created']}</td>"
+        f"<td><a href='/admin/{key}/delete/{s['id']}' "
+        f"onclick=\"return confirm('이 스토어를 삭제할까요?')\">삭제</a></td></tr>" for s in stores)
     return Response(f"""<!DOCTYPE html><html lang="ko"><meta charset="utf-8">
 <title>관리자 — 스토어 목록</title>
 <style>body{{font-family:system-ui,'Malgun Gothic',sans-serif;padding:30px;font-size:14px}}
@@ -331,7 +345,7 @@ table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:6px 12px;t
 th{{background:#f5f5f2}}</style>
 <h2>등록 스토어 {len(stores)}곳</h2>
 <table><tr><th>ID</th><th>스토어</th><th>고유링크</th><th>키워드</th><th>실행수</th>
-<th>마지막 수집</th><th>등록일</th></tr>{rows}</table>""", mimetype="text/html")
+<th>마지막 수집</th><th>등록일</th><th></th></tr>{rows}</table>""", mimetype="text/html")
 
 
 # ---------------- 화면 ----------------
