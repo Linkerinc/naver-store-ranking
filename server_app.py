@@ -111,22 +111,25 @@ def _fetch_factory():
 
 
 def collect_store(store_id):
-    with db() as con:
-        st = con.execute("SELECT * FROM stores WHERE id=?", (store_id,)).fetchone()
-        kws = con.execute("SELECT * FROM keywords WHERE store_id=? ORDER BY id",
-                          (store_id,)).fetchall()
-    if not st or not kws:
-        RUN_STATUS[store_id] = {"running": False, "error": "키워드가 없습니다. 먼저 등록해 주세요."}
-        return
-    fetch = _fetch_factory()
-    store_cfg = {"name": st["name"], "aliases": []}
     status = RUN_STATUS.setdefault(store_id, {})
-    status.update(running=True, done=0, total=len(kws), current="", error=None)
-    results = []
     try:
+        print(f"[collect] 시작: store {store_id}", flush=True)
+        with db() as con:
+            st = con.execute("SELECT * FROM stores WHERE id=?", (store_id,)).fetchone()
+            kws = con.execute("SELECT * FROM keywords WHERE store_id=? ORDER BY id",
+                              (store_id,)).fetchall()
+        if not st or not kws:
+            status.update(running=False, error="키워드가 없습니다. 먼저 등록해 주세요.")
+            return
+        fetch = _fetch_factory()
+        store_cfg = {"name": st["name"], "aliases": []}
+        status.update(running=True, done=0, total=len(kws), current="", error=None)
+        results = []
         for i, k in enumerate(kws):
             status.update(done=i, current=k["keyword"])
+            print(f"[collect] ({i+1}/{len(kws)}) {k['keyword']}", flush=True)
             items = fetch(k["keyword"], st["name"])
+            print(f"[collect]   → {len(items)}개 수집됨", flush=True)
             kw_cfg = {"keyword": k["keyword"], "product": k["product"]}
             results.append(analyze_keyword(kw_cfg, items, store_cfg, SEARCH_CFG, RULES))
         status.update(done=len(kws), current="리포트 저장 중")
@@ -141,8 +144,10 @@ def collect_store(store_id):
             con.execute("""DELETE FROM runs WHERE store_id=? AND id NOT IN
                          (SELECT id FROM runs WHERE store_id=? ORDER BY id DESC LIMIT 60)""",
                         (store_id, store_id))
+        print(f"[collect] 완료: store {store_id}", flush=True)
     except Exception as e:  # noqa
         status["error"] = f"수집 중 오류: {e}"
+        print(f"[collect] 오류: store {store_id}: {e}", flush=True)
     finally:
         status["running"] = False
 
@@ -152,11 +157,25 @@ def worker():
         store_id = JOBS.get()
         try:
             collect_store(store_id)
+        except Exception as e:  # 최후 방어선 — 작업자는 절대 죽지 않는다
+            RUN_STATUS.setdefault(store_id, {}).update(
+                running=False, error=f"수집 실패: {e}")
+            print(f"[worker] 예외: {e}", flush=True)
         finally:
             JOBS.task_done()
 
 
-threading.Thread(target=worker, daemon=True).start()
+_worker_thread = threading.Thread(target=worker, daemon=True)
+_worker_thread.start()
+
+
+def _ensure_worker():
+    """작업자 스레드가 죽어 있으면 되살린다."""
+    global _worker_thread
+    if not _worker_thread.is_alive():
+        print("[worker] 재기동", flush=True)
+        _worker_thread = threading.Thread(target=worker, daemon=True)
+        _worker_thread.start()
 
 
 
@@ -263,9 +282,11 @@ def api_store_run(token):
                                 "msg": f"잠시 후 다시 시도해 주세요 (약 {int(wait // 60) + 1}분 후 가능)."})
         except ValueError:
             pass
+    _ensure_worker()
     RUN_STATUS[st["id"]] = {"running": True, "done": 0, "total": 0,
                             "current": "대기열 등록됨", "error": None}
     JOBS.put(st["id"])
+    print(f"[run] 대기열 등록: store {st['id']}", flush=True)
     return jsonify({"ok": True})
 
 
