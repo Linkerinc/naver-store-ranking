@@ -16,26 +16,40 @@ API_TEST = "https://openapi.naver.com/v1/search/shop.json"
 
 
 def detect_store_name(url: str):
-    """스마트스토어 주소에서 스토어명(판매처명) 자동 감지."""
+    """스마트스토어 주소에서 스토어명(판매처명) 자동 감지.
+
+    네이버가 서버(데이터센터)發 접근에 에러 페이지를 주는 경우가 있어,
+    에러/오류 페이지 제목이 잡히면 None을 반환해 직접 입력으로 넘긴다.
+    """
     if not url.startswith("http"):
         url = "https://" + url
+    bad = ("에러", "오류", "시스템", "점검", "error", "not found", "존재하지 않", "naver")
+
+    def ok(name):
+        name = (name or "").strip()
+        if not name:
+            return None
+        low = name.lower()
+        if any(b in low for b in bad):
+            return None
+        return name
+
     try:
         r = requests.get(url, headers=UA, timeout=(4, 6))
         html = r.content.decode("utf-8", "ignore")
-        # 1) 스마트스토어 내부 데이터의 채널명 (가장 정확)
         m = re.search(r'"channelName"\s*:\s*"([^"]+)"', html)
         if m:
-            return m.group(1).strip()
-        # 2) og:title 메타태그
+            n = ok(m.group(1))
+            if n:
+                return n
         m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
         if m:
-            name = re.sub(r"\s*(입니다|스토어입니다)\s*$", "", m.group(1)).strip()
-            if name:
-                return name
-        # 3) <title>
+            n = ok(re.sub(r"\s*(입니다|스토어입니다)\s*$", "", m.group(1)))
+            if n:
+                return n
         m = re.search(r"<title>([^<]+)</title>", html)
         if m:
-            return m.group(1).split(":")[0].split("|")[0].strip()
+            return ok(m.group(1).split(":")[0].split("|")[0])
     except Exception:
         pass
     return None
