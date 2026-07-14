@@ -64,6 +64,7 @@ TEMPLATE = r"""<!DOCTYPE html>
   .tip b{display:block;margin-bottom:2px}
   .legend{display:flex;gap:16px;font-size:12px;color:var(--ink2);margin-bottom:10px;flex-wrap:wrap}
   .legend span{display:inline-flex;align-items:center;gap:6px}
+  .hidden{display:none}
   .sw{width:10px;height:10px;border-radius:3px;display:inline-block}
 </style>
 </head>
@@ -94,6 +95,20 @@ TEMPLATE = r"""<!DOCTYPE html>
   <h2>시장 평균가 대비 우리 가격</h2>
   <div class="desc">0% = 시장 평균과 동일 · 오른쪽(+)은 평균보다 비쌈, 왼쪽(−)은 저렴</div>
   <div id="diverging"></div>
+</div>
+
+<div class="card hidden" id="trendCard">
+  <h2>검색량 트렌드 &amp; 기회 키워드</h2>
+  <div class="desc">네이버 데이터랩 12개월 검색 추세 × 우리 순위 결합 판정 (수집 시점 기준)</div>
+  <div id="trendBody"></div>
+  <div class="desc" style="margin-top:10px;line-height:1.8">
+    · <b>12개월 추세</b>: 최근 1년 네이버 검색 관심도 흐름 (오른쪽이 올라가면 수요 증가 중) &nbsp;
+    · <b>최근 3개월</b>: 직전 3개월 대비 변화율 &nbsp;
+    · <b>검색량 크기</b>: 등록 키워드 간 상대 규모<br>
+    · <b>피크 시즌</b>: 검색이 가장 몰리는 달 — 1~2개월 전부터 노출·재고 준비 권장 &nbsp;
+    · 판정: 🎯 기회 = 검색량 활발 + 우리 100위 밖 / 💪 강점 = 검색량 활발 + 100위 이내<br>
+    · 검색량은 네이버 데이터랩 상대값(기간 내 최고=100)으로 정확한 횟수가 아닌 흐름·비교용 지표입니다.
+  </div>
 </div>
 
 <div class="tip" id="tip"></div>
@@ -229,6 +244,73 @@ if(rows2.length){
   });
   divEl.addEventListener("mouseleave", hideTip);
 }
+
+/* ---------- 검색량 트렌드 & 기회 키워드 ---------- */
+(function(){
+  const withTrend = DATA.results.filter(r=>r.trend);
+  if(!withTrend.length) return;
+  document.getElementById("trendCard").classList.remove("hidden");
+  const TAGS = {
+    "기회":{bg:"#eef4fc",color:"#1c5cab",label:"🎯 기회 — 검색량 대비 노출 부족"},
+    "강점":{bg:"#e2efda",color:"#1f7a33",label:"💪 강점 — 지키세요"},
+    "유지":{bg:"#f0efec",color:"#52514e",label:"유지"},
+    "관망":{bg:"#f0efec",color:"#898781",label:"관망"},
+    "데이터부족":{bg:"#f0efec",color:"#898781",label:"검색량 미미"},
+  };
+  const sparkT = series => {
+    if(!series || series.length<2) return "";
+    const vals = series.map(d=>d.ratio);
+    const mx = Math.max(...vals,1), W=90, H=22;
+    const pts = vals.map((v,i)=>`${(i/(vals.length-1)*W).toFixed(1)},${(H-2-(v/mx)*(H-4)).toFixed(1)}`).join(" ");
+    return `<svg width="${W}" height="${H}"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+  };
+  const dirT = t => t.direction==="up" ? `<b style="color:var(--good-text)">↑ 상승</b>`
+    : t.direction==="down" ? `<b style="color:var(--crit)">↓ 하락</b>`
+    : t.direction==="flat" ? "→ 유지" : "–";
+  const sizeT = v => v==null ? "-" : v>=1.5 ? "매우 큼" : v>=0.8 ? "큼" : v>=0.4 ? "보통" : "작음";
+  let rows = `<tr><th>키워드</th><th>12개월 추세</th><th>최근 3개월</th><th>검색량 크기</th>
+    <th>피크 시즌</th><th class="num">우리 순위</th><th>판정</th></tr>`;
+  for(const r of withTrend){
+    const t = r.trend, tag = TAGS[t.tag] || TAGS["관망"];
+    const pct = t.trend_ratio ? ` <span style="color:var(--muted);font-size:11px">(${t.trend_ratio>=1?"+":""}${Math.round((t.trend_ratio-1)*100)}%)</span>` : "";
+    rows += `<tr>
+      <td><div class="rowlab">${r.keyword}</div></td>
+      <td>${sparkT(t.series)}</td>
+      <td>${dirT(t)}${pct}</td>
+      <td>${sizeT(t.size_index)}</td>
+      <td>${t.peak_month ? t.peak_month+"월" : "-"}</td>
+      <td class="num">${r.our_rank ? r.our_rank+"위" : '<span class="rank-miss">1000위 밖</span>'}</td>
+      <td><span class="badge" style="background:${tag.bg};color:${tag.color};padding:2px 10px;border-radius:10px">${tag.label}</span></td>
+    </tr>`;
+  }
+  let html = `<table>${rows}</table>`;
+  const guideT = r => {
+    const kw = r.keyword, nospace = kw.replace(/ /g,"");
+    const t = r.trend;
+    const rankTxt = r.our_rank==null ? "현재 1000위 밖이라" : `현재 ${r.our_rank}위라`;
+    const peak = t.peak_month ? `${t.peak_month}월` : null;
+    return `<details style="margin-top:8px;background:var(--surface);border:1px solid var(--grid);border-radius:8px;padding:8px 12px">
+    <summary style="cursor:pointer;font-weight:700;font-size:13px;color:var(--accent)">▶ "${kw}" 이렇게 개선하세요 (누르면 펼쳐집니다)</summary>
+    <ol style="margin:10px 0 4px 18px;font-size:12.5px;color:var(--ink2);line-height:1.9">
+      <li><b>상품명에 키워드 넣기 (효과 가장 큼)</b> — 스마트스토어센터 → 상품관리에서 해당 상품의 상품명에
+        "<b>${kw}</b>" 표현을 자연스럽게 포함하세요. ${rankTxt}, 고객이 검색하는 단어가 상품명에 없으면 상위 노출이 어렵습니다.</li>
+      <li><b>태그 10개 채우기</b> — 상품 수정 → 검색설정 → 태그에 "${nospace}", "${kw}" 처럼
+        붙여쓰기·띄어쓰기·연관 표현을 모두 추가하세요 (최대 10개까지 꽉 채우기).</li>
+      <li><b>카테고리·속성 점검</b> — 카테고리가 키워드와 어긋나면 노출이 제한됩니다. 속성 정보도 빈칸 없이.</li>
+      <li><b>블로그 콘텐츠 발행</b> — "${kw}" 제목의 사용기·추천 글을 네이버 블로그에 발행해 검색 유입 보완 (링커 블로그잇 대행 가능).</li>
+      ${peak ? `<li><b>타이밍</b> — 피크 시즌 <b>${peak}</b> 기준 1~2개월 전까지 위 작업과 재고 확보 완료.</li>` : ""}
+      <li><b>효과 확인</b> — 적용 후 3~7일 뒤 다시 수집해 순위 변화를 확인하세요.</li>
+    </ol></details>`;
+  };
+  const opps = withTrend.filter(r=>r.trend.tag==="기회");
+  if(opps.length){
+    html = `<div style="background:#eef4fc;border-left:4px solid var(--accent);border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:12px;font-size:13px">
+      <b>🎯 기회 키워드 ${opps.length}개 — ${opps.map(r=>r.keyword).join(", ")}</b><br>
+      <span style="color:var(--ink2)">검색량은 활발한데 우리 노출이 부족합니다. 아래 키워드별 가이드를 따라 하면 노출을 끌어올릴 수 있습니다.</span>
+      ${opps.map(guideT).join("")}</div>` + html;
+  }
+  document.getElementById("trendBody").innerHTML = html;
+})();
 </script>
 </body>
 </html>
@@ -253,6 +335,7 @@ def render_dashboard_html(results, summary, store_name, run_date):
             "market": r["market"], "percentile": r["percentile"],
             "vs_min_pct": r["vs_min_pct"], "vs_avg_pct": r["vs_avg_pct"],
             "verdict": r["verdict"], "excluded": r.get("excluded", 0),
+            "trend": r.get("trend"),
             "competitors": comps,
         })
     return (TEMPLATE

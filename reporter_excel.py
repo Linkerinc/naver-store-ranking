@@ -196,5 +196,101 @@ def build_excel(results, summary, store_name, run_date, out_path):
                     if c == 4:
                         cell.number_format = "#,##0"
 
+    # ---------- 검색량 트렌드 시트 (트렌드 데이터가 있을 때만) ----------
+    with_trend = [r for r in results if r.get("trend")]
+    if with_trend:
+        wst = wb.create_sheet("검색량트렌드", 1)
+        wst.sheet_view.showGridLines = False
+        wst["B1"] = "검색량 트렌드 & 기회 키워드"
+        wst["B1"].font = Font(name=FONT, size=12, bold=True)
+        wst["B2"] = "네이버 데이터랩 12개월 검색 추세 × 우리 순위 결합 판정 (수집 시점 기준)"
+        wst["B2"].font = Font(name=FONT, size=9, color="595959")
+
+        headers = ["키워드", "최근 3개월 추세", "변화율", "검색량 크기",
+                   "피크 시즌", "우리 순위", "판정", "권장 액션"]
+        widths = [28, 14, 10, 12, 10, 10, 12, 46]
+        _write_header(wst, 4, headers, widths)
+
+        DIR_TXT = {"up": "↑ 상승", "down": "↓ 하락", "flat": "→ 유지", "none": "-"}
+        ACTION = {
+            "기회": "상품명·태그에 키워드 반영, 블로그 콘텐츠로 노출 보완",
+            "강점": "현재 순위·가격 유지, 재고 확보",
+            "유지": "시즌 지남 — 현상 유지",
+            "관망": "우선순위 낮음",
+            "데이터부족": "검색량 매우 적음 — 더 일반적인 키워드 검토",
+        }
+        TAG_FILL = {"기회": PatternFill("solid", fgColor="DDEBF7"),
+                    "강점": GOOD_FILL, "유지": None, "관망": None,
+                    "데이터부족": None}
+
+        def size_txt(v):
+            if v is None:
+                return "-"
+            return "매우 큼" if v >= 1.5 else "큼" if v >= 0.8 else                    "보통" if v >= 0.4 else "작음"
+
+        for i, r in enumerate(with_trend):
+            t = r["trend"]
+            row = 5 + i
+            ratio = t.get("trend_ratio")
+            pct = f'{(ratio - 1) * 100:+.0f}%' if ratio else "-"
+            tag = t.get("tag", "관망")
+            vals = [r["keyword"], DIR_TXT.get(t.get("direction"), "-"), pct,
+                    size_txt(t.get("size_index")),
+                    f'{t["peak_month"]}월' if t.get("peak_month") else "-",
+                    r["our_rank"] if r["our_rank"] else "1000위 밖",
+                    ("🎯 " if tag == "기회" else "💪 " if tag == "강점" else "") + tag,
+                    ACTION.get(tag, "")]
+            for c, v in enumerate(vals, 1):
+                cell = wst.cell(row=row, column=c, value=v)
+                cell.font = BASE_FONT
+                cell.border = THIN
+                if c in (2, 3, 4, 5, 6, 7):
+                    cell.alignment = Alignment(horizontal="center")
+            f = TAG_FILL.get(tag)
+            if f:
+                for c in range(1, 9):
+                    wst.cell(row=row, column=c).fill = f
+            if tag == "기회":
+                wst.cell(row=row, column=7).font = Font(name=FONT, size=10,
+                                                        bold=True, color="1C5CAB")
+
+        note = 5 + len(with_trend) + 1
+        wst.cell(row=note, column=1,
+                 value="* 검색량은 네이버 데이터랩 상대값(기간 내 최고=100) 기반 — 정확한 검색 횟수가 아닌 흐름·비교용 지표"
+                 ).font = Font(name=FONT, size=9, color="808080")
+        wst.cell(row=note + 1, column=1,
+                 value="* 기회 = 검색량 활발(상승 또는 규모 큼) + 우리 순위 100위 밖 → 노출 개선 시 매출 기대가 큰 키워드"
+                 ).font = Font(name=FONT, size=9, color="808080")
+
+        # 기회 키워드별 개선 가이드
+        opps = [r for r in with_trend if r["trend"].get("tag") == "기회"]
+        if opps:
+            row = note + 3
+            head = wst.cell(row=row, column=1, value="■ 기회 키워드 개선 가이드")
+            head.font = Font(name=FONT, size=11, bold=True)
+            row += 1
+            for r in opps:
+                kw = r["keyword"]
+                nospace = kw.replace(" ", "")
+                peak = r["trend"].get("peak_month")
+                rank_txt = f'{r["our_rank"]}위' if r["our_rank"] else "1000위 밖"
+                steps = [
+                    f'🎯 "{kw}"  (현재 {rank_txt})',
+                    f'  1. 상품명에 키워드 넣기(효과 가장 큼): 스마트스토어센터 → 상품관리에서 상품명에 "{kw}" 표현을 자연스럽게 포함',
+                    f'  2. 태그 10개 채우기: 상품 수정 → 검색설정 → 태그에 "{nospace}", "{kw}" 등 붙여쓰기·띄어쓰기·연관 표현 추가',
+                    '  3. 카테고리·속성 점검: 키워드와 맞는 카테고리인지 확인, 속성 정보 빈칸 없이',
+                    f'  4. 블로그 콘텐츠 발행: "{kw}" 제목의 사용기·추천 글 발행 (링커 블로그잇 대행 가능)',
+                ]
+                if peak:
+                    steps.append(f'  5. 타이밍: 피크 시즌 {peak}월 기준 1~2개월 전까지 작업·재고 준비 완료')
+                steps.append('  6. 적용 3~7일 후 다시 수집해서 순위 변화 확인')
+                for line in steps:
+                    c = wst.cell(row=row, column=1, value=line)
+                    bold = line.startswith("🎯")
+                    c.font = Font(name=FONT, size=10, bold=bold,
+                                  color="1C5CAB" if bold else "404040")
+                    row += 1
+                row += 1
+
     wb.save(out_path)
     return out_path

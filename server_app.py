@@ -31,7 +31,7 @@ from analyzer import analyze_keyword, store_summary
 from reporter_dashboard import render_dashboard_html
 from reporter_excel import build_excel
 from setup_wizard import detect_store_name
-from trend import fetch_trends
+from trend import fetch_trends, classify
 
 KST = timezone(timedelta(hours=9))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
@@ -249,18 +249,7 @@ def api_trends(token):
         rank = rank_map.get(k, "미수집")
         direction = t.get("direction", "none")
         size = t.get("size_index")
-        exposed_good = isinstance(rank, int) and rank <= 100
-        active = direction == "up" or (size or 0) >= 0.6
-        if direction == "none":
-            tag = "데이터부족"
-        elif active and not exposed_good:
-            tag = "기회"
-        elif active and exposed_good:
-            tag = "강점"
-        elif direction == "down" and exposed_good:
-            tag = "유지"
-        else:
-            tag = "관망"
+        tag = classify(direction, size, rank if isinstance(rank, int) else None)
         items.append({
             "keyword": k, "series": t.get("series", []),
             "direction": direction, "trend_ratio": t.get("trend_ratio"),
@@ -322,7 +311,29 @@ def api_run_step(token):
     if len(p["results"]) < len(p["kws"]):
         return jsonify({"ok": True, "done": False, "next": len(p["results"])})
 
-    # 마지막 키워드 완료 → 리포트 저장
+    # 마지막 키워드 완료 → 트렌드 스냅샷 부착 후 리포트 저장
+    try:
+        kw_list = [r["keyword"] for r in p["results"]]
+        with db() as con:
+            trows = con.execute(
+                "SELECT keyword, payload FROM trends WHERE keyword IN (%s)"
+                % ",".join("?" * len(kw_list)), kw_list).fetchall()
+        tmap = {r["keyword"]: json.loads(r["payload"]) for r in trows}
+        for r in p["results"]:
+            t = tmap.get(r["keyword"])
+            if t:
+                r["trend"] = {
+                    "series": t.get("series", []),
+                    "direction": t.get("direction"),
+                    "trend_ratio": t.get("trend_ratio"),
+                    "size_index": t.get("size_index"),
+                    "peak_month": t.get("peak_month"),
+                    "tag": classify(t.get("direction"), t.get("size_index"),
+                                    r["our_rank"]),
+                }
+    except Exception as e:
+        print(f"[run] 트렌드 부착 실패(무시): {e}", flush=True)
+
     summ = store_summary(p["results"])
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     with db() as con:
@@ -667,6 +678,28 @@ function spark(series){
   const pts = vals.map((v,i)=>`${(i/(vals.length-1)*W).toFixed(1)},${(H-2-(v/max)*(H-4)).toFixed(1)}`).join(" ");
   return `<svg width="${W}" height="${H}"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
 }
+function guideHtml(d){
+  const kw = d.keyword, nospace = kw.replace(/ /g,"");
+  const rankTxt = d.our_rank==null || d.our_rank==="미수집" ? "현재 1000위 밖이라"
+    : `현재 ${d.our_rank}위라`;
+  const peak = d.peak_month ? `${d.peak_month}월` : null;
+  return `<details style="margin-top:8px;background:var(--surface);border:1px solid var(--grid);border-radius:8px;padding:8px 12px">
+  <summary style="cursor:pointer;font-weight:700;font-size:13px;color:var(--accent)">▶ "${kw}" 이렇게 개선하세요 (누르면 펼쳐집니다)</summary>
+  <ol style="margin:10px 0 4px 18px;font-size:12.5px;color:var(--ink2);line-height:1.9">
+    <li><b>상품명에 키워드 넣기 (효과 가장 큼)</b> — 스마트스토어센터 → 상품관리에서 해당 상품의 상품명에
+      "<b>${kw}</b>" 표현을 자연스럽게 포함하세요. ${rankTxt}, 고객이 검색하는 단어가 상품명에 없으면 상위 노출이 어렵습니다.
+      <span class="pill">예: 기존 상품명이 "3M 슈퍼그립 장갑"이면 → "3M 슈퍼그립 ${kw}" 처럼 검색어를 상품명에 녹이기</span></li>
+    <li><b>태그 10개 채우기</b> — 상품 수정 → 검색설정 → 태그에 "${nospace}", "${kw}" 처럼
+      붙여쓰기·띄어쓰기·연관 표현을 모두 추가하세요 (최대 10개까지 꽉 채우기).</li>
+    <li><b>카테고리·속성 점검</b> — 카테고리가 키워드와 어긋나면 노출이 제한됩니다.
+      속성 정보(규격·소재·용도)도 빈칸 없이 채우세요.</li>
+    <li><b>블로그 콘텐츠 발행</b> — "${kw}" 제목의 사용기·추천 글을 네이버 블로그에 올리면
+      검색 유입을 이중으로 잡을 수 있습니다 (링커 블로그잇 서비스로 대행 가능).</li>
+    ${peak ? `<li><b>타이밍</b> — 이 키워드의 피크 시즌은 <b>${peak}</b>입니다. 피크 1~2개월 전까지 위 작업과 재고 확보를 끝내두세요.</li>` : ""}
+    <li><b>효과 확인</b> — 적용 후 3~7일 뒤 "지금 수집하기"로 순위 변화를 확인하세요.
+      상품명 수정은 반영에 며칠 걸릴 수 있습니다.</li>
+  </ol></details>`;
+}
 async function loadTrends(){
   const el = document.getElementById("trendBody");
   let r;
@@ -695,11 +728,23 @@ async function loadTrends(){
     </tr>`;
   }
   html += "</tbody></table>";
+  html += `<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;color:var(--accent);font-weight:600">ℹ️ 이 표 읽는 법 (누르면 펼쳐집니다)</summary>
+  <div style="font-size:12px;color:var(--ink2);line-height:1.8;margin-top:8px">
+  · <b>12개월 추세</b>: 최근 1년간 네이버에서 이 키워드가 얼마나 검색됐는지의 흐름입니다. 선이 오른쪽에서 올라가면 지금 수요가 커지는 중입니다.<br>
+  · <b>최근 3개월</b>: 직전 3개월 대비 최근 3개월 검색량 변화율. <b style="color:var(--good)">↑ 상승(+20% 이상)</b>이면 수요 증가, <b style="color:var(--crit)">↓ 하락(−20% 이상)</b>이면 시즌이 지나가는 중.<br>
+  · <b>검색량 크기</b>: 등록한 키워드들 사이의 상대적 검색 규모입니다 (첫 번째 키워드 기준). "큼"인 키워드가 잡을 가치가 큰 시장입니다.<br>
+  · <b>피크 시즌</b>: 1년 중 검색이 가장 몰리는 달. <b>피크 1~2개월 전부터</b> 노출·재고를 준비하는 게 좋습니다.<br>
+  · <b>판정 기준</b>: 🎯 <b>기회</b> = 검색량이 활발(상승 중이거나 규모 큼)한데 우리 순위가 100위 밖 → 잡으면 매출로 이어질 가능성이 가장 큰 키워드.
+  💪 <b>강점</b> = 검색량 활발 + 우리 100위 이내 → 순위·가격을 지키세요.
+  <b>유지</b> = 순위는 좋지만 검색량이 줄어드는 중. <b>관망</b> = 검색량 작고 우리 노출도 부족.<br>
+  · 검색량 수치는 네이버 데이터랩의 상대값(기간 내 최고=100)으로, 정확한 검색 횟수가 아닌 흐름·비교용 지표입니다.
+  </div></details>`;
   const opps = r.items.filter(d=>d.tag==="기회");
   if(opps.length){
     html = `<div style="background:#eef4fc;border-left:4px solid var(--accent);border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:12px;font-size:13px">
       <b>🎯 기회 키워드 ${opps.length}개</b> — ${opps.map(d=>d.keyword).join(", ")}<br>
-      <span style="color:var(--ink2)">검색량은 활발한데 우리 노출이 부족합니다. 상품명·태그에 키워드 반영, 블로그 콘텐츠 보완을 검토하세요.</span></div>` + html;
+      <span style="color:var(--ink2)">검색량은 활발한데 우리 노출이 부족합니다. 아래 키워드별 가이드를 따라 하면 노출을 끌어올릴 수 있습니다.</span>
+      ${opps.map(guideHtml).join("")}</div>` + html;
   }
   el.innerHTML = html;
 }
