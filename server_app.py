@@ -31,6 +31,7 @@ from analyzer import analyze_keyword, store_summary
 from reporter_dashboard import render_dashboard_html
 from reporter_excel import build_excel
 from setup_wizard import detect_store_name
+from trend import fetch_trends
 
 KST = timezone(timedelta(hours=9))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
@@ -82,6 +83,11 @@ def init_db():
           run_at TEXT NOT NULL,
           summary TEXT NOT NULL,
           results TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS trends(
+          keyword TEXT PRIMARY KEY,
+          fetched_at TEXT NOT NULL,
+          payload TEXT NOT NULL
         );
         """)
 
@@ -191,6 +197,77 @@ def api_kw_save(token):
         con.execute("DELETE FROM keywords WHERE store_id=?", (st["id"],))
         con.executemany("INSERT INTO keywords(store_id, keyword, product) VALUES(?,?,?)", clean)
     return jsonify({"ok": True, "count": len(clean), "max": MAX_KEYWORDS})
+
+
+@app.get("/s/<token>/api/trends")
+def api_trends(token):
+    st = _store_or_404(token)
+    with db() as con:
+        kws = [r["keyword"] for r in con.execute(
+            "SELECT keyword FROM keywords WHERE store_id=? ORDER BY id", (st["id"],))]
+    if not kws:
+        return jsonify({"ok": True, "items": []})
+
+    # 캐시 확인 (7일)
+    cutoff = (datetime.now(KST) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+    with db() as con:
+        rows = con.execute(
+            "SELECT keyword, fetched_at, payload FROM trends WHERE keyword IN (%s)"
+            % ",".join("?" * len(kws)), kws).fetchall()
+    cached = {r["keyword"]: r for r in rows}
+    stale = [k for k in kws if k not in cached or cached[k]["fetched_at"] < cutoff]
+
+    trends = {k: json.loads(cached[k]["payload"]) for k in kws if k in cached}
+    if stale:
+        try:
+            fresh = fetch_trends(CLIENT_ID, CLIENT_SECRET, kws, demo=DEMO)
+            now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+            with db() as con:
+                for k, v in fresh.items():
+                    con.execute(
+                        "INSERT INTO trends(keyword, fetched_at, payload) VALUES(?,?,?) "
+                        "ON CONFLICT(keyword) DO UPDATE SET fetched_at=?, payload=?",
+                        (k, now, json.dumps(v, ensure_ascii=False),
+                         now, json.dumps(v, ensure_ascii=False)))
+            trends.update(fresh)
+        except Exception as e:
+            if not trends:
+                return jsonify({"ok": False, "msg": f"검색량 조회 실패: {e}"})
+
+    # 최근 수집의 키워드별 우리 순위
+    rank_map = {}
+    with db() as con:
+        last = con.execute("SELECT results FROM runs WHERE store_id=? ORDER BY id DESC LIMIT 1",
+                           (st["id"],)).fetchone()
+    if last:
+        for r in json.loads(last["results"]):
+            rank_map[r["keyword"]] = r["our_rank"]
+
+    items = []
+    for k in kws:
+        t = trends.get(k) or {}
+        rank = rank_map.get(k, "미수집")
+        direction = t.get("direction", "none")
+        size = t.get("size_index")
+        exposed_good = isinstance(rank, int) and rank <= 100
+        active = direction == "up" or (size or 0) >= 0.6
+        if direction == "none":
+            tag = "데이터부족"
+        elif active and not exposed_good:
+            tag = "기회"
+        elif active and exposed_good:
+            tag = "강점"
+        elif direction == "down" and exposed_good:
+            tag = "유지"
+        else:
+            tag = "관망"
+        items.append({
+            "keyword": k, "series": t.get("series", []),
+            "direction": direction, "trend_ratio": t.get("trend_ratio"),
+            "peak_month": t.get("peak_month"), "size_index": size,
+            "our_rank": rank, "tag": tag,
+        })
+    return jsonify({"ok": True, "items": items})
 
 
 @app.post("/s/<token>/api/run_start")
@@ -380,7 +457,7 @@ STYLE = r"""
   .btn-s{background:transparent;color:var(--ink2);border:1px solid var(--grid)}
   .msg{font-size:13px;margin-top:10px}.msg.err{color:var(--crit)}.msg.ok{color:var(--good)}
   table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}
-  th{text-align:left;font-size:12px;color:var(--ink2);padding:6px 8px;border-bottom:1px solid var(--grid)}
+  th{text-align:left;font-size:12px;color:var(--ink2);padding:6px 8px;border-bottom:1px solid var(--grid);white-space:nowrap}
   td{padding:6px 8px;border-bottom:1px solid var(--grid)} td input{padding:7px 10px!important}
   .del{color:var(--crit);cursor:pointer;font-weight:700;background:none;border:none;font-size:15px}
   .bar{height:8px;background:var(--grid);border-radius:6px;overflow:hidden;margin-top:12px}
@@ -493,6 +570,12 @@ CONSOLE = r"""<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>검색량 트렌드 &amp; 기회 키워드</h2>
+    <div class="desc">네이버 검색량 12개월 추세(데이터랩) × 우리 순위 결합 판정 · 검색량은 주 1회 자동 갱신 · 순위는 최근 수집 기준</div>
+    <div id="trendBody"><span class="pill">불러오는 중...</span></div>
+  </div>
+
+  <div class="card">
     <h2>수집 실행</h2>
     <div class="desc">키워드별로 네이버쇼핑 1,000위까지 탐색합니다. (키워드당 3~5초)</div>
     <div style="display:flex;gap:10px;align-items:center">
@@ -568,6 +651,57 @@ async function runNow(){
   btn.disabled=false;
   setTimeout(()=>{ bar.classList.add("hidden"); stat.classList.add("hidden"); }, 4000);
   const st = await j(api("state")); render(st);
+  loadTrends();
+}
+const TAG = {
+  "기회":   {bg:"#eef4fc", color:"#1c5cab", label:"🎯 기회 — 검색량 대비 노출 부족"},
+  "강점":   {bg:"#e2efda", color:"#1f7a33", label:"💪 강점 — 지키세요"},
+  "유지":   {bg:"#f0efec", color:"#52514e", label:"유지"},
+  "관망":   {bg:"#f0efec", color:"#898781", label:"관망"},
+  "데이터부족": {bg:"#f0efec", color:"#898781", label:"검색량 미미"},
+};
+function spark(series){
+  if(!series || series.length < 2) return "";
+  const vals = series.map(d=>d.ratio);
+  const max = Math.max(...vals, 1), W=90, H=22;
+  const pts = vals.map((v,i)=>`${(i/(vals.length-1)*W).toFixed(1)},${(H-2-(v/max)*(H-4)).toFixed(1)}`).join(" ");
+  return `<svg width="${W}" height="${H}"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+}
+async function loadTrends(){
+  const el = document.getElementById("trendBody");
+  let r;
+  try{ r = await j(api("trends")); }catch(e){ r = {ok:false, msg:"불러오기 실패"}; }
+  if(!r.ok){ el.innerHTML = `<span class="pill">${r.msg||"불러오기 실패"}</span>`; return; }
+  if(!r.items.length){ el.innerHTML = '<span class="pill">키워드를 먼저 저장하면 검색량 추세가 표시됩니다.</span>'; return; }
+  const dirTxt = d => d.direction==="up" ? `<b style="color:var(--good)">↑ 상승</b>`
+    : d.direction==="down" ? `<b style="color:var(--crit)">↓ 하락</b>`
+    : d.direction==="flat" ? `→ 유지` : `–`;
+  const sizeTxt = v => v==null ? "-" : v>=1.5 ? "매우 큼" : v>=0.8 ? "큼" : v>=0.4 ? "보통" : "작음";
+  let html = `<table><thead><tr><th>키워드</th><th>12개월 추세</th><th>최근 3개월</th>
+    <th>검색량 크기</th><th>피크 시즌</th><th>우리 순위</th><th>판정</th></tr></thead><tbody>`;
+  for(const d of r.items){
+    const t = TAG[d.tag] || TAG["관망"];
+    const rank = d.our_rank==="미수집" ? '<span class="pill">미수집</span>'
+      : (d.our_rank==null ? '<span style="color:var(--crit)">1000위 밖</span>' : d.our_rank+"위");
+    const pct = d.trend_ratio ? ` <span class="pill">(${d.trend_ratio>=1?"+":""}${Math.round((d.trend_ratio-1)*100)}%)</span>` : "";
+    html += `<tr>
+      <td><b>${d.keyword}</b></td>
+      <td>${spark(d.series)}</td>
+      <td>${dirTxt(d)}${pct}</td>
+      <td>${sizeTxt(d.size_index)}</td>
+      <td>${d.peak_month ? d.peak_month+"월" : "-"}</td>
+      <td>${rank}</td>
+      <td><span style="display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px;font-weight:600;background:${t.bg};color:${t.color}">${t.label}</span></td>
+    </tr>`;
+  }
+  html += "</tbody></table>";
+  const opps = r.items.filter(d=>d.tag==="기회");
+  if(opps.length){
+    html = `<div style="background:#eef4fc;border-left:4px solid var(--accent);border-radius:0 8px 8px 0;padding:10px 14px;margin-bottom:12px;font-size:13px">
+      <b>🎯 기회 키워드 ${opps.length}개</b> — ${opps.map(d=>d.keyword).join(", ")}<br>
+      <span style="color:var(--ink2)">검색량은 활발한데 우리 노출이 부족합니다. 상품명·태그에 키워드 반영, 블로그 콘텐츠 보완을 검토하세요.</span></div>` + html;
+  }
+  el.innerHTML = html;
 }
 function render(st){
   const el=document.getElementById("repList");
@@ -580,7 +714,7 @@ function render(st){
       <span class="pill">${info}</span></div>`;
   }).join("");
 }
-(async()=>{ loadKeywords(); const st=await j(api("state")); render(st); })();
+(async()=>{ loadKeywords(); const st=await j(api("state")); render(st); loadTrends(); })();
 </script></body></html>"""
 
 
